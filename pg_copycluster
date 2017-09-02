@@ -1,0 +1,177 @@
+#!/usr/bin/perl -wT
+
+# Copy a PostgreSQL cluster
+#
+# (C) 2017 Laurent Debacker <debackerl gmail com>
+# (C) 2014-2016 Christoph Berg <myon@debian.org>
+#
+#  This program is free software; you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation; either version 2 of the License, or
+#  (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+
+use strict;
+use warnings;
+use PgCommon;
+use Getopt::Long;
+use POSIX;
+use File::Copy;
+use File::Path;
+use File::Spec::Functions qw( catfile );
+
+sub copyr {
+    my ($src, $dst) = @_;
+    return system ( 'cp', '-rpP', $src, $dst ) == 0;
+}
+
+# untaint environment
+$ENV{'PATH'} = '/bin:/usr/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+if (@ARGV != 3) {
+    print "Usage: $0 [OPTIONS] <version> <old cluster name> <new cluster name>\n";
+    exit 1;
+}
+
+my ($version) = $ARGV[0] =~ /^(\d+\.?\d+)$/;
+my ($oldcluster) = $ARGV[1] =~ /^([-.\w]+)$/;
+my ($newcluster) = $ARGV[2] =~ /^([-.\w]+)$/;
+if ($newcluster =~ /-/ and -t 1) {
+    print "Warning: cluster names containing dashes (-) will cause problems when running from systemd. Continuing anyway\n";
+}
+
+error "Old and new name must be different"
+    if ($oldcluster eq $newcluster);
+error "specified cluster $version $oldcluster does not exist"
+    unless (cluster_exists $version, $oldcluster);
+error "target cluster $version $newcluster already exists"
+    if (cluster_exists $version, $newcluster);
+error "version must be at least 9.3"
+    if ($version < '9.3');
+my %info = cluster_info ($version, $oldcluster);
+
+# Arguments: <string>, <from>, <to>
+sub strrepl {
+    my ($s, $f, $t) = @_;
+    $s =~ s/\b\Q$f\E\b/$t/g;
+    return $s;
+}
+
+# copy config directory
+my $olddir = "$PgCommon::confroot/$version/$oldcluster";
+my $newdir = "$PgCommon::confroot/$version/$newcluster";
+copyr $olddir, $newdir or
+    error "Could not copy config directory $olddir: $!";
+
+# adapt paths to configuration files
+my %c = read_cluster_conf_file $version, $newcluster, 'postgresql.conf';
+if ($c{hba_file}) {
+    PgCommon::set_conf_value $version, $newcluster, 'postgresql.conf', 'hba_file',
+        strrepl($c{hba_file}, $oldcluster, $newcluster);
+}
+if ($c{ident_file}) {
+    PgCommon::set_conf_value $version, $newcluster, 'postgresql.conf', 'ident_file',
+        strrepl($c{ident_file}, $oldcluster, $newcluster);
+}
+if ($c{external_pid_file}) {
+    PgCommon::set_conf_value $version, $newcluster, 'postgresql.conf', 'external_pid_file',
+        strrepl($c{external_pid_file}, $oldcluster, $newcluster);
+}
+
+# update cluster_name
+if ($c{cluster_name}) {
+    PgCommon::set_conf_value $version, $newcluster, 'postgresql.conf', 'cluster_name',
+        strrepl ($c{cluster_name}, $oldcluster, $newcluster);
+
+}
+
+# copy data directory
+if ($info{pgdata}) {
+    my $newpgdata = strrepl ($info{pgdata}, $oldcluster, $newcluster);
+    if ($info{pgdata} ne $newpgdata) {
+        PgCommon::set_conf_value $version, $newcluster, 'postgresql.conf',
+            'data_directory', $newpgdata;
+        if ($info{'running'}) {
+            my $basebackup = get_program_path 'pg_basebackup', $version;
+            my $socket = get_cluster_socketdir $version, $oldcluster;
+            if (not -d $newpgdata) {
+                mkpath $newpgdata  or
+                    error "Could not create data directory $newpgdata";
+            }
+            my ($login, $pass, $uid, $gid) = getpwnam('postgres') or
+                error "Could not find user 'postgres'";
+            chown $uid, $gid, $newpgdata;
+            chmod 0700, $newpgdata;
+            # -X stream requires pg >= 9.3, wal_level to 'archive', 'hot_standby', or 'logical', and max_wal_senders to at least 2
+            system ('su', '-c', "$basebackup -h $socket -p $info{'port'} -D $newpgdata -X stream -P", 'postgres') == 0 or
+                error "Could not copy data directory $info{pgdata} to $newpgdata";
+        } else {
+            copyr $info{pgdata}, $newpgdata or
+                error "Could not copy data directory $info{pgdata} to $newpgdata";
+        }
+    }
+}
+
+# copy stats_temp_directory
+my $statstempdir = $info{config}->{stats_temp_directory};
+if ($statstempdir) {
+    my $newstatstempdir = strrepl ($statstempdir, $oldcluster, $newcluster);
+    if ($statstempdir ne $newstatstempdir) {
+        PgCommon::set_conf_value $version, $newcluster, 'postgresql.conf',
+            'stats_temp_directory', $newstatstempdir;
+        if (-d $statstempdir) {
+            copyr $statstempdir, $newstatstempdir or
+                error "Could not copy stats temp directory $statstempdir}: $!";
+        }
+    }
+}
+
+# copy old log files
+my $logdir = "/var/log/postgresql";
+if (opendir LOG, $logdir) {
+    while (my $logfile = readdir LOG) {
+        next unless $logfile =~ /^(\Qpostgresql-$version-$oldcluster.log\E.*)/;
+        $logfile = $1; # untaint
+        my $f = strrepl ($logfile, $oldcluster, $newcluster);
+        copyr "$logdir/$logfile", "$logdir/$f" or error "copy $logdir/$logfile: $!";
+    }
+    closedir LOG;
+}
+
+__END__
+
+=head1 NAME
+
+pg_copycluster - copy a PostgreSQL cluster
+
+=head1 SYNOPSIS
+
+B<pg_copycluster> I<version> I<oldname> I<newname>
+
+=head1 DESCRIPTION
+
+B<pg_copycluster> copies an existing PostgreSQL cluster, i. e. the name of
+the config directory in /etc/postgresql/I<version>/ along with the data
+directory in /var/lib/postgresql/I<version>/.  Existing log files in
+/var/log/postgresql/ are not copied.
+
+The following B<postgresql.conf> config options are updated to refer to the
+changed path names: B<data_directory>, B<hba_file>, B<ident_file>,
+B<external_pid_file>, B<stats_temp_directory>.
+
+Cluster names are a Debian convention, the name is not explicitly known to the
+cluster itself.  From the PostgreSQL viewpoint, the name is merely a substring
+of various path names.
+
+=head1 OPTIONS
+
+None.
+
+=head1 AUTHOR
+
+Laurent Debacker<E<lt>debackerl gmail comE<gt>>
