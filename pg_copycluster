@@ -21,12 +21,43 @@ use PgCommon;
 use Getopt::Long;
 use POSIX;
 use File::Copy;
+use File::stat;
 use File::Path;
 use File::Spec::Functions qw( catfile );
 
-sub copyr {
+sub copydir {
     my ($src, $dst) = @_;
-    return system ( 'cp', '-rpP', $src, $dst ) == 0;
+
+    opendir my $dir_h, $src or return 0;
+
+    if ( not -d $dst ) {
+        if ( not mkpath $dst ) {
+            warn "Could not create directory: '$dst'";
+            closedir $dir_h;
+            return 0;
+        }
+    }
+
+    while ( my $file = readdir $dir_h ) {
+        next if $file =~ m{^\.\.?\z};
+        my ($src_path) = (catfile $src, $file) =~ /^([^\0]+)\z/;
+        my ($dst_path) = (catfile $dst, $file) =~ /^([^\0]+)\z/;
+
+        if ( -d $src_path ) {
+            copydir($src_path, $dst_path);
+        } elsif ( -f _ ) {
+            if ( not copy $src_path, $dst_path ) {
+                warn "Could not copy from '$src_path' to '$dst_path'";
+                closedir $dir_h;
+                return 0;
+            }
+        } else {
+            warn "Skipping '$src_path'\n";
+        }
+    }
+
+    closedir $dir_h;
+    return 1;
 }
 
 # untaint environment
@@ -65,7 +96,7 @@ sub strrepl {
 # copy config directory
 my $olddir = "$PgCommon::confroot/$version/$oldcluster";
 my $newdir = "$PgCommon::confroot/$version/$newcluster";
-copyr $olddir, $newdir or
+copydir $olddir, $newdir or
     error "Could not copy config directory $olddir: $!";
 
 # adapt paths to configuration files
@@ -96,24 +127,19 @@ if ($info{pgdata}) {
     if ($info{pgdata} ne $newpgdata) {
         PgCommon::set_conf_value $version, $newcluster, 'postgresql.conf',
             'data_directory', $newpgdata;
-        if ($info{'running'}) {
-            my $basebackup = get_program_path 'pg_basebackup', $version;
-            my $socket = get_cluster_socketdir $version, $oldcluster;
-            if (not -d $newpgdata) {
-                mkpath $newpgdata  or
-                    error "Could not create data directory $newpgdata";
-            }
-            my ($login, $pass, $uid, $gid) = getpwnam('postgres') or
-                error "Could not find user 'postgres'";
-            chown $uid, $gid, $newpgdata;
-            chmod 0700, $newpgdata;
-            # -X stream requires pg >= 9.3, wal_level to 'archive', 'hot_standby', or 'logical', and max_wal_senders to at least 2
-            system ('su', '-c', "$basebackup -h $socket -p $info{'port'} -D $newpgdata -X stream -P", 'postgres') == 0 or
-                error "Could not copy data directory $info{pgdata} to $newpgdata";
-        } else {
-            copyr $info{pgdata}, $newpgdata or
-                error "Could not copy data directory $info{pgdata} to $newpgdata";
+        my $basebackup = get_program_path 'pg_basebackup', $version;
+        my $socket = get_cluster_socketdir $version, $oldcluster;
+        if (not -d $newpgdata) {
+            mkpath $newpgdata  or
+                error "Could not create data directory $newpgdata";
         }
+        my ($login, $pass, $uid, $gid) = getpwnam('postgres') or
+            error "Could not find user 'postgres'";
+        chown $uid, $gid, $newpgdata;
+        chmod 0700, $newpgdata;
+        # -X stream requires pg >= 9.3, wal_level to 'archive', 'hot_standby', or 'logical', and max_wal_senders to at least 2
+        system ('su', '-c', "$basebackup -h $socket -p $info{'port'} -D $newpgdata -X stream -P", 'postgres') == 0 or
+            error "Could not copy data directory $info{pgdata}: $!";
     }
 }
 
@@ -125,7 +151,7 @@ if ($statstempdir) {
         PgCommon::set_conf_value $version, $newcluster, 'postgresql.conf',
             'stats_temp_directory', $newstatstempdir;
         if (-d $statstempdir) {
-            copyr $statstempdir, $newstatstempdir or
+            copydir $statstempdir, $newstatstempdir or
                 error "Could not copy stats temp directory $statstempdir}: $!";
         }
     }
@@ -138,7 +164,9 @@ if (opendir LOG, $logdir) {
         next unless $logfile =~ /^(\Qpostgresql-$version-$oldcluster.log\E.*)/;
         $logfile = $1; # untaint
         my $f = strrepl ($logfile, $oldcluster, $newcluster);
-        copyr "$logdir/$logfile", "$logdir/$f" or error "copy $logdir/$logfile: $!";
+        copy "$logdir/$logfile", "$logdir/$f" or error "copy $logdir/$logfile: $!";
+        my $filestat = stat ("$logdir/$logfile");
+        chown $filestat->uid, $filestat->gid, "$logdir/$f";
     }
     closedir LOG;
 }
